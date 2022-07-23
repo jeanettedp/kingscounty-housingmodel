@@ -1,0 +1,889 @@
+---
+title: "Predicting House Prices in Kings County"
+subtitle: Jeanette Perez
+geometry: "left=1cm,right=1cm,top=1cm,bottom=2cm"
+fontsize: 10 pt
+output: 
+    pdf_document: default
+    df_print: paged
+---
+
+```{r, message=F, warning=F, include=F}
+# Loading libraries needed and initial set up
+library(readr)
+library(tidyverse)
+library(caret)
+library(fastDummies)
+library(olsrr)
+library(MASS)
+library(glmnet)
+library(data.table)
+library(janitor)
+library(corrplot)
+library(car)
+library(lmtest)
+library(randomForest)
+library(knitr)
+library(olsrr)
+library(rpart)
+library(rpart.plot)
+library(kableExtra)
+
+rm(list=ls())
+options(scipen = 999)
+theme_set(theme_bw())
+```
+
+# Model Purpose
+Our group was tasked with building a model to predict house sale prices for Washington's Kings County, which includes the city of Seattle. To build this model, we investigated the KC_House_Sales dataset, which contains information about homes sold in Kings County between May 2014 and May 2015, including their final sale price in US Dollars.
+
+# Data Description & Cleaning
+Reading in the KC_House_Sales dataset into a data frame, we can see that this dataset consists of 21,613 house sale observations and contains information about 21 different independent variables.
+
+```{r}
+KC_House_Sales <- read_csv("KC_House_Sales.csv") %>% as.data.frame()
+```
+A critical first step in our investigation is to clean and prepare the data for analysis. Here, our goal is to identify and remove any errors, missing data, or duplicate data in order to create a reliable dataset. This will improve the overall quality of the data and increase the accuracy of our model.
+
+First, we checked for missing values and duplicate observations. None were found. Next, we investigated variable data types to see if any reformatting was needed.
+```{r, include=F}
+sum(is.na(KC_House_Sales))
+nrow(unique(KC_House_Sales)) == nrow(KC_House_Sales)
+str(KC_House_Sales)
+```
+
+As a result of this investigation, we first decided to remove the variables *id*, *long*, and *lat* from our dataset since they are not needed for our model's purpose. We then decided to convert *price* to a numeric variable, and *date* to a date-object. Additionally, we decided to treat the variables *zipcode*, *view*, *condition*, and *grade* as factor variables, and we re-categorized *grade* into three levels for simplicity: low-quality, average-quality, and high-quality. Lastly, in order to be able to include categorical variables as predictors in our model, we created dummy variables to replace them.
+```{r}
+KC_House_Sales <- KC_House_Sales %>%
+        # Convert price to clean numeric format
+        mutate(price = as.numeric(gsub(pattern="\\$|,", replacement="", x=KC_House_Sales$price))) %>%
+        # Remove id, long, lat
+        dplyr::select(-c(id, long, lat)) %>% 
+        # Change date type, convert zipcode to character variable (or factor variable)
+        mutate(date = as.Date(date), zipcode = as.character(zipcode)) %>% 
+        # Convert `view` and `condition` to factor variables
+        mutate_at(c("view","condition"), factor) %>%
+        # Recategorize grade
+        mutate(grade_category = case_when(
+                grade<=3  ~ "low_quality",
+                grade>=11 ~ "high_quality",
+                TRUE      ~ "average_quality")) %>%
+        mutate(month_sold = month(date))
+
+# Convert categorical variables to dummies 
+KC_House_Sales <- dummy_cols(
+  KC_House_Sales, select_columns=c("view", "condition", "grade_category","zipcode", "month_sold"),
+  remove_first_dummy = T,remove_selected_columns = T)
+```
+# Model Development Process
+## Data Processing
+First, we created a correlation matrix of all of our numerical predictor variables to see which are most strongly correlated to the variable we want to predict, *price*. From the matrix, we can see that *bedrooms*, *bathrooms*, *sqft_living*, *sqft_above*, *sqft_basement*, and *sqft_living15* seem to have a strong positive correlation (> ~0.5) with price. A strong correlation between two variables means they have a strong relationship with each other, while a low correlation means that the variables are hardly related. As a result, these variables might be good predictors for price, so we must consider them for our model.
+```{r, fig.align='center', fig.width=7, fig.height=7}
+corrplot(cor(
+  KC_House_Sales %>% 
+    dplyr::select(c(price, bedrooms, bathrooms, sqft_living, sqft_lot, floors, sqft_above, sqft_basement,
+                    yr_built, yr_renovated, sqft_living15, sqft_lot15))), method="number")
+```
+
+Next, we took a closer look at some of our independent variables to see if any further data processing was needed.
+
+## Checking Independent Variables
+
+### `waterfront`
+This variable indicates whether a house overlooks the waterfront. Through initial analysis of this variable, we found that houses that overlook the waterfront make up less than 1% of all observations. Next, we investigated whether there was a difference in price between waterfront and non-waterfront properties. From out analysis, we found that the mean price for waterfront houses (\$1,661,876) is more than double that of non-waterfront houses (\$531,563). To test if this difference in mean price between waterfront and non-waterfront properties is statistically significant, we performed a Welch's t-test, where:
+```{r, include=F}
+tabyl(KC_House_Sales$waterfront)
+KC_House_Sales %>% group_by(waterfront) %>% summarize(mean_price=mean(price))
+```
+
+Ho: The means for both groups are equal
+\
+Ha: The means for both groups are not equal
+\
+Decision rule: Reject Ho if p-value < 0.05
+
+Since the p-value is < 0.05, we reject the null hypothesis and conclude that there is a significant difference in price between waterfront and non-waterfront properties. The results of this test show us that the *waterfront* variable can play a part in predicting price, so we should include this variable in our model.
+```{r}
+t.test(KC_House_Sales %>% subset(waterfront==1) %>% dplyr::select(price), 
+       KC_House_Sales %>% subset(waterfront==0) %>% dplyr::select(price))
+```
+
+### `yr_built`
+This variable tells us the year the house was built. After graphing the data, we found that houses built in different years have different mean prices. For example, there is a dip in mean price for houses built in the early 1940s, and a somewhat steady positive trend afterwards indicating that newer houses tend to have a higher mean price. This shows us that *yr_built* can play a part in predicting price, so we should include this variable in our model.
+```{r, fig.align='center', fig.width=5, fig.height=4}
+KC_House_Sales %>% group_by(yr_built) %>% summarize(mean_price=mean(price)) %>% 
+  plot(type="b", cex=0.5, main="Mean Price vs. Year Built")
+```
+
+After analyzing the data further, our group decided that it would be more useful for our study to know the age of the house, rather than the year it was built. As a result, we converted the *yr_built* into a variable called *age*. Taking a closer look at the *age* variable, we noticed that its values were slightly left-skewed. In order to make our data as normal as possible, we performed log and scale transformations on *age*. We will decide later in the model development process which transformation is better suited for our data.
+```{r}
+# Create a new variable called age 
+KC_House_Sales$age <- year(KC_House_Sales$date) - KC_House_Sales$yr_built
+KC_House_Sales$age <- ifelse(KC_House_Sales$age < 0, 0, KC_House_Sales$age)
+
+# Transformations
+KC_House_Sales$log_age <- log(KC_House_Sales$age + 1)
+KC_House_Sales$scaled_age <- scale(KC_House_Sales$age, scale=FALSE)
+```
+
+```{r, include=F}
+# Histogram for data visualization
+par(mfrow=c(1,2))
+hist(KC_House_Sales$age, breaks=30, xlab="Age", main="")
+```
+
+### `yr_renovated`
+
+This variable tells us the year of the house’s last renovation. Through initial analysis of this variable, we found that roughly 95% of the houses in our data set have not undergone a renovation. Because of this, our group decided that it would be more useful to know whether or not a house has been renovated, rather than knowing the year of the house's last renovation. To do this, we created a new dummy variable called *renovated_dummy* which is 1 if the house has ever been renovated, and 0 otherwise.
+```{r, include=F}
+tabyl(KC_House_Sales$yr_renovated == 0)
+```
+
+```{r}
+KC_House_Sales$renovated_dummy <- 1*(KC_House_Sales$yr_renovated != 0)
+```
+
+Next, we investigated whether there was a difference in price between renovated and non-renovated properties. Here, we can see that the mean price for renovated houses (\$760,379) is higher than that of non-renovated houses (\$530,360). To test if this difference in mean price between renovated and non-renovated properties is statistically significant, we performed a Welch's t-test, where:
+
+Ho: The means for both groups are equal
+\
+Ha: The means for both groups are not equal
+\
+Decision rule: Reject Ho if p-value < 0.05
+
+Since the p-value of our t-test is < 0.05, we reject the null hypothesis and conclude that there is enough evidence to say that there is a significant difference in price between renovated and non-renovated properties. The results of this test show us that the *renovated_dummy* variable can play a part in predicting price, so we should include this variable in our model.
+```{r, include=F}
+KC_House_Sales %>% group_by(renovated_dummy) %>% summarize(mean_price=mean(price))
+```
+
+```{r}
+t.test(KC_House_Sales %>% subset(renovated_dummy==1) %>% dplyr::select(price), 
+       KC_House_Sales %>% subset(renovated_dummy==0) %>% dplyr::select(price))
+```
+### `sqft_*`
+Our dataset contains six variables related to square footage: *sqft_above*, *sqft_living*, *sqft_lot*, *sqft_basement*, *sqft_living15*, *sqft_lot15*. Because of this, we wanted to check if any of these variables were correlated with one another. From our correlation matrix, we can see that there is very strong correlation between *sqft_above* and *sqft_living*. After some thought, we realized that this comes from the fact that adding *sqft_above* and *sqft_basement* gives us *sqft_living* for each observation in our dataset. Knowing this information, our group decided to drop *sqft_above* from our model.
+```{r, fig.align='center', fig.width=4, fig.height=4}
+corrplot(cor(KC_House_Sales %>% 
+                  dplyr::select(c(sqft_above, sqft_living, sqft_lot, sqft_basement,
+                                  sqft_living15, sqft_lot15))), method="color")
+```
+
+```{r, include=F}
+# Checking perfect collinearity
+all(KC_House_Sales$sqft_living == KC_House_Sales$sqft_above + KC_House_Sales$sqft_basement)
+```
+
+Taking a look at the rest of the variables, we can see that their values are right-skewed. In order to make our data as normal as possible, we performed log and scale transformations on these variables. We will decide later in the model development process which transformation is better suited for our data.
+
+```{r, fig.align='center', fig.width=7, fig.height=4}
+# Transformations 
+KC_House_Sales <- 
+        KC_House_Sales %>% 
+        mutate(across(contains('sqft_'), .fns = list(log = function(x) log(x+1),
+                                                     scaled = ~scale(., center = T, scale = T))))
+
+par(mfrow=c(2,3))
+hist(KC_House_Sales$sqft_above, breaks = 30, main="", xlab="sqft_above")
+hist(KC_House_Sales$sqft_living, breaks = 30, main="", xlab="sqft_living")
+hist(KC_House_Sales$sqft_lot, breaks = 30, main="", xlab="sqft_lot")
+hist(KC_House_Sales$sqft_basement, breaks = 30, main="", xlab="sqft_basement")
+hist(KC_House_Sales$sqft_living15, breaks = 30, main="", xlab="sqft_living15")
+hist(KC_House_Sales$sqft_lot15, breaks = 30, main="", xlab="sqft_lot15")
+```
+
+### `date`
+
+To investigate the effects of *date* on house price, our group decided to group houses by a new variable, *month_sold*. With this new variable, we can take a look at how many houses sold each month of the year, and see what the mean price was for houses sold each month. From our plots, we can see that there is a sharp increase in number of houses sold from April-July, and that houses sold during these months tend to have a higher mean price than houses sold in other months. This shows us that the *month_sold* variable can play a part in predicting price, so we should include this variable in our model.
+```{r, fig.align='center', fig.width=7, fig.height=2.5}
+KC_House_Sales$month_sold <- month(KC_House_Sales$date)
+
+month_effects <- KC_House_Sales %>% group_by(month_sold) %>%
+        summarize(number_of_house_sold = n(), avg_price_sold = mean(price))
+
+p1 <- ggplot(month_effects, aes(x=month_sold, y=number_of_house_sold)) +
+        geom_point(alpha=0.7) + geom_line(alpha=0.7) + labs(title="Number of Houses Sold/Month") + 
+        scale_x_continuous(breaks=1:12)
+
+p2 <- ggplot(month_effects, aes(x=month_sold, y=avg_price_sold)) + 
+        geom_point(alpha=0.7) +  geom_line(alpha=0.7) + 
+        labs(title="Avg. Price of House Sold/Month") + scale_x_continuous(breaks=1:12) + 
+        scale_y_continuous(labels = function(x) paste0(x, "$"))
+
+gridExtra::grid.arrange(p1, p2, ncol=2)
+```
+## Train-Test Split
+Before making any more progress, we split our data into training and test datasets. We will use 70% of the data to train our model, and keep 30% of the data to perform final testing of our model.
+```{r}
+set.seed(1023)
+DataSplit <- createDataPartition(y=KC_House_Sales$price, p=0.7, list=F)
+train_df <- KC_House_Sales[DataSplit, ]
+test_df <- KC_House_Sales[-DataSplit, ]
+```
+## Building a Basic Model with Logged Independent Variables
+For this model, we used *price* as our response variable, and the following as predictor variables: *bedrooms*, *bathrooms*, *sqft_living_log*, *sqft_basement_log*, *sqft_lot_log*, *sqft_living15_log*, *sqft_lot15_log*, *floors*, *waterfront*, *renovated_dummy*, *renovated_dummy:log_age*, *log_age*, *month_sold*, *condition*, *view*, *grade_category*, and *zipcode*. Overall, this model fits our data well, with an Adjusted R-Squared value of 0.788.
+```{r}
+lm.model_basic <- lm(as.formula
+                     (paste("price ~",
+                            paste(c("bedrooms", "bathrooms", "sqft_living_log", "sqft_basement_log",
+                                    "sqft_lot_log", "sqft_living15_log", "sqft_lot15_log", "floors", "waterfront",
+                                    "renovated_dummy", "renovated_dummy:log_age", "log_age", 
+                                    paste0("condition_", 2:5), paste0("view_", 1:4),
+                                    grep("grade_category", names(KC_House_Sales), value=T),
+                                    grep("month_sold_", names(KC_House_Sales), value=T),
+                                    grep("zipcode", names(KC_House_Sales), value = T)), collapse = "+"))), data = train_df)
+summary_basic <- summary(lm.model_basic)
+summary_basic$adj.r.squared
+```
+
+## Checking the Dependent Variable
+Taking a closer look at our dependent variable, the histogram below shows that *price* values are right-skewed. Since normality is an important assumption for many statistical techniques, we decided to apply a Box-Cox transformation to see if a transformation will help our data meet the normality assumption.
+```{r, fig.align='center', fig.width=5, fig.height=3}
+layout(mat = matrix(c(1,2),2,1, byrow=TRUE),  height = c(1,8))
+par(mar=c(0, 3.1, 1.1, 2.1))
+boxplot(KC_House_Sales$price , horizontal=TRUE , xaxt="n" , col="steelblue" , frame=F)
+par(mar=c(4, 3.1, 1.1, 2.1))
+hist(KC_House_Sales$price , breaks=60 , col="steelblue" , border=F , main="" , xlab="House Price")
+abline(v = mean(KC_House_Sales$price), lwd=2, lty=2)
+text(x=mean(KC_House_Sales$price) + 800000, y=3000,
+     paste0("mean=$", format(round(mean(KC_House_Sales$price)), big.mark=",")), cex=0.7)
+```
+
+From our Box-Cox results, we can see that lambda reaches a maximum around zero, indicating that a log(Y) transformation would be the best transformation. After performing a log transformation on *price*, our histogram now shows a bell curve which is indicative of a more normal distribution.
+```{r, fig.align='center', fig.width=5, fig.height=3}
+# Box Cox transformation on basic model
+bc <- boxcox(lm.model_basic, lambda=seq(-0.5 , 0.5 ,by=0.1))
+
+# Log transformation on price
+KC_House_Sales$log_price <- log(KC_House_Sales$price + 1)
+
+# Histogram for price after transformation
+layout(mat = matrix(c(1,2),2,1, byrow=TRUE),  height = c(1,8))
+par(mar=c(0, 3.1, 1.1, 2.1))
+boxplot(KC_House_Sales$log_price , horizontal=TRUE , xaxt="n", col="steelblue" , frame=F)
+par(mar=c(4, 3.1, 1.1, 2.1))
+hist(KC_House_Sales$log_price , breaks=60 , col="steelblue", border=F , main="" , xlab="Log(House Price)")
+abline(v = mean(KC_House_Sales$price), lwd=2, lty=2)
+```
+
+## Building a Basic Model with Scaled Independent Variables
+
+For this model, we used *price* as our response variable, and the following as predictor variables: *bedrooms*, *bathrooms*, *sqft_living_scaled*, *sqft_basement_scaled*, *sqft_lot_scaled*, *sqft_living15_scaled*, *sqft_lot15_scaled*, *floors*, *waterfront*, *renovated_dummy*, *renovated_dummy:scaled_age*, *scaled_age*, *month_sold*, *condition*, *view*, *grade_category*, and *zipcode*. This model fits our data better than our previous model, with a higher Adjusted R-Squared value of 0.820.
+```{r}
+lm.model_basic_scaled <- lm(as.formula(paste("price ~", paste(c("bedrooms", "bathrooms",
+                                                 "sqft_living_scaled", "sqft_basement_scaled",
+                                                 "sqft_lot_scaled", "sqft_living15_scaled",
+                                                 "sqft_lot15_scaled",
+                                                 "floors", "waterfront",
+                                                 "renovated_dummy", "renovated_dummy:scaled_age",
+                                                 "scaled_age",
+                                                 paste0("condition_", 2:5),
+                                                 paste0("view_", 1:4),
+                                                 grep("grade_category", names(KC_House_Sales), value=T),
+                                                 grep("month_sold_", names(KC_House_Sales), value=T),
+                                                 grep("zipcode", names(KC_House_Sales), value = T)
+                                         ), collapse = "+"))), data = train_df)
+summary_basic_scaled <- summary(lm.model_basic_scaled)
+summary_basic_scaled$adj.r.squared
+```
+We know that *price* values are right-skewed, so we will also apply a Box-Cox transformation here to see if a log(Y) transformation is still the best transformation for our data. From our Box-Cox results, once again we can see that lambda reaches a maximum around zero, this confirms that a log(Y) transformation is the best transformation.
+```{r, fig.align='center', fig.width=5, fig.height=3}
+# Box Cox transformation on our best model
+bc_scaled <- boxcox(lm.model_basic_scaled, lambda=seq(-.5 , 0.5, by=0.1))
+```
+## Transformed Model
+
+Based on our investigation so far, we know that a scale transformation of our independent variables and a log transformation of our dependent variables are the best for our dataset. Here, we use both of those transformations to build a new transformed model. This model outperforms both of our previous models, with an Adjusted R-squared of 0.868.
+```{r, include=F}
+# Re-splitting the data, to add log(price) variables to train and test datasets
+set.seed(1023)
+DataSplit <- createDataPartition(y=KC_House_Sales$price, p=0.7, list=F)
+train_df <- KC_House_Sales[DataSplit, ]
+test_df <- KC_House_Sales[-DataSplit, ]
+```
+
+```{r}
+lm.model_bc <- lm(as.formula(paste("log_price ~",
+                                 paste(c("bedrooms", "bathrooms",
+                                                 "sqft_living_scaled", "sqft_basement_scaled",
+                                                 "sqft_lot_scaled", "sqft_living15_scaled",
+                                                 "sqft_lot15_scaled",
+                                                 "floors", "waterfront",
+                                                 "renovated_dummy",  "renovated_dummy:scaled_age",
+                                                 "scaled_age",
+                                                 paste0("condition_", 2:5),
+                                                 paste0("view_", 1:4),
+                                                 grep("grade_category", names(KC_House_Sales), value=T),
+                                         grep("month_sold_", names(KC_House_Sales), value=T),
+                                                 grep("zipcode", names(KC_House_Sales), value = T)
+                                         ), collapse = "+"))), data = train_df)
+
+summary_bc <- summary(lm.model_bc)
+summary_bc$adj.r.squared
+```
+
+## Interaction Terms
+
+Earlier, we determined that the mean price between a renovated and a non-renovated house was statistically significant. We also observed that the age of the house might play a factor in price. As a result, we included a *renovated_dummy* x *age* interaction term in our models above to see if the relationship between a house's age and if it had been renovated could help our model better predict *price*. Our models gave us good results, but we still want to verify that this interaction is meaningful. To do this, we used an ANOVA test to compare our full model (model with the interaction) to our reduced model (model without the interaction). For this test:
+
+Ho: Coefficients are equal to zero
+\
+Ha: Coefficients are not equal to zero
+
+Decision rule: Reject Ho if p-value < 0.05.
+
+Analyzing the ANOVA results (Appendix #1), we have a p-value of 0.1815 > 0.05. This means that we can accept the null hypothesis, and conclude that the coefficients tested are equal to zero. Since the coefficients are not significantly different from zero, this indicates that this interaction does not help our model performance, and that we should drop it from our future models.
+```{r}
+# Creating a model without the interaction term
+lm.model_bc_wo_interaction <- lm(as.formula(paste("log_price ~",
+                                 paste(c("bedrooms", "bathrooms",
+                                                 "sqft_living_scaled", "sqft_basement_scaled",
+                                                 "sqft_lot_scaled", "sqft_living15_scaled",
+                                                 "sqft_lot15_scaled",
+                                                 "floors", "waterfront",
+                                                 "renovated_dummy", "scaled_age",
+                                                 paste0("condition_", 2:5),
+                                                 paste0("view_", 1:4),
+                                                 grep("grade_category", names(KC_House_Sales), value=T),
+                                         grep("month_sold_", names(KC_House_Sales), value=T),
+                                                 grep("zipcode", names(KC_House_Sales), value = T)
+                                         ), collapse = "+"))), data = train_df)
+
+summary_bc_wo_interaction <- summary(lm.model_bc_wo_interaction)
+summary_bc_wo_interaction$adj.r.squared
+```
+
+```{r, include=F}
+anova(lm.model_bc, lm.model_bc_wo_interaction)
+```
+
+## Stepwise Variable Selection
+Using the stepwise both ways method, we found that the best model for this data should remove the following variables: *zipcode_98178*, *zipcode_98122*, *view_2*, *zipcode_98108*, *zipcode_98024*, *zipcode_98166*, *zipcode_98058*, *zipcode_98038*. This code takes a substantial amount of time to run, for this reason, our results can be found in Appendix #2 instead of here.
+```{r}
+# Stepwise variable selection on model without interaction
+#k_stepwise <- ols_step_both_p(lm.model_bc_wo_interaction, pent=0.1, prem=0.05, details = F)
+#k_stepwise
+```
+Due to these results, we decided to remove the variable *view_2* from our model. However, we did not remove the zipcode variables, because they are 'fixed effects' in our model. This results in a slight change to our Adjusted R-squared value, 0.866.
+```{r}
+remove_vars <- c("view_2")
+rm_var <- paste(paste0("-", remove_vars), collapse = " ")
+
+final_model <- update(lm.model_bc_wo_interaction, paste0(".~.", rm_var))
+summary_final <- summary(final_model)
+summary_final$adj.r.squared
+```
+## Checking Outliers
+Next, we wanted to evaluate our data for outliers. Here, the CooksD chart shows that there are many outliers and the threshold is 0.000286638 according to Type 5. Thus, we removed 964 observations from train data set. Our resulting model showed an increase in Adjusted R-squared to 0.904.
+
+```{r, fig.align='center', fig.height=4}
+ols_plot_cooksd_chart(final_model)
+```
+
+```{r, include=F}
+cooksD <- cooks.distance(final_model)
+influential <- cooksD[(cooksD > 3*( mean(cooksD, na.rm = TRUE)))] # Type 5
+names_of_influential <- names(influential)
+outliers <- train_df[names_of_influential,]
+train_df_wo_outlier <- train_df %>% anti_join(outliers)
+```
+
+```{r}
+lm.model_wo_outlier <- lm(as.formula(paste("log_price ~",
+                                 paste(c("bedrooms", "bathrooms",
+                                                 "sqft_living_scaled", "sqft_basement_scaled",
+                                                 "sqft_lot_scaled", "sqft_living15_scaled",
+                                                 "sqft_lot15_scaled", "floors", "waterfront",
+                                                 "renovated_dummy", "scaled_age",
+                                         "grade_category_high_quality",
+                                                 paste0("condition_", 2:5),
+                                                 paste0("view_", c(1, 3, 4)),
+                                                 grep("zipcode", names(KC_House_Sales), value = T),
+                                         grep("month_sold_", names(KC_House_Sales), value=T)
+                                         ), collapse = "+"))), data = train_df_wo_outlier)
+
+summary_wo_outlier <- summary(lm.model_wo_outlier)
+summary_wo_outlier$adj.r.squared
+```
+# Model Performance Testing
+To test our models, we created the following function that tests the input model against our test dataset. This function outputs various model statistics, including: Multiple R-Squared, Adjusted R-Squared, MAE, and MSE.
+```{r}
+# Function to measure model performance 
+model_performance <- function(model, y_variable=c("log_price","price")){
+        pred_model <- data.frame(true = test_df[[y_variable]], pred = predict(model, test_df))
+        performance <- data.frame(r2 = summary(model)$adj.r.squared,
+                                  r2.adj = summary(model)$adj.r.squared,
+                                  test_mae = mean(abs(pred_model$true - pred_model$pred)),
+                                  test_mse =  mean((pred_model$true - pred_model$pred)^2))
+        return(performance)
+}
+```
+
+## Checking Assumptions
+
+```{r, fig.align='center'}
+par(mfrow=c(2,2))
+plot(lm.model_wo_outlier)
+```
+
+### Testing Unequal Variance and Multicollinearity
+
+```{r}
+bptest_result <- bptest(lm.model_wo_outlier)
+bptest_result
+```
+
+```{r}
+sort(vif(lm.model_wo_outlier), decreasing=T)[1:5]
+```
+
+## Remedial Measures
+In the previous section, our model was shown to violate the equal variance assumption, and there also seemed to be some issues with multicollinearity. As a result, we applied the following remedial measures to help our model meet these assumptions moving forward.
+
+### Dropping Variables with Large VIF
+
+First, since the largest VIFs were for the condition_* variables, we wanted to test the effects of removing these variables from our model. This resulted in way better VIF results (VIF < 10).
+
+```{r}
+lm.model_drop_condition_345 <- lm(as.formula(paste("log_price ~",
+                                 paste(c("bedrooms", "bathrooms",
+                                                 "sqft_living_scaled", "sqft_basement_scaled",
+                                                 "sqft_lot_scaled", "sqft_living15_scaled",
+                                                 "sqft_lot15_scaled", "floors",
+                                                 "waterfront", "renovated_dummy",
+                                                 "scaled_age",
+                                                 "grade_category_high_quality", "condition_2",
+                                                 paste0("view_", c(1, 3, 4)),
+                                                 grep("zipcode", names(KC_House_Sales), value = T),
+                                         grep("month_sold_", names(KC_House_Sales), value=T)
+                                         ), collapse = "+"))), data = train_df_wo_outlier)
+
+sort(vif(lm.model_drop_condition_345), decreasing=T)[1:5]
+```
+
+### WLS
+
+Next, we applied the Weighted Least Squares method. The WLS technique is used when the constant variance assumption is violated.
+
+```{r}
+# First iteration
+x_best <-
+  c("bedrooms", "bathrooms", "sqft_living_scaled", "sqft_basement_scaled",
+    "sqft_lot_scaled", "sqft_living15_scaled", "sqft_lot15_scaled", "floors",
+    "waterfront", "renovated_dummy", "scaled_age", "grade_category_high_quality",
+    paste0("condition_", 2:5),
+    paste0("view_", c(1, 3, 4)),
+    grep("month_sold_", names(KC_House_Sales), value=T),
+    grep("zipcode", names(KC_House_Sales), value = T))
+
+train_df_wo_outlier$abs.ei <- abs(lm.model_wo_outlier$residuals)
+g1 <- lm(as.formula(paste("abs.ei ~",  paste(x_best, collapse = "+"))), data = train_df_wo_outlier)
+s <- g1$fitted.values
+wi = 1/(s^2)
+g2 <- lm(as.formula(paste("log_price ~", paste(x_best, collapse = "+"))), weights=wi, data = train_df_wo_outlier)
+model_wls1_performance <- model_performance(g2, "log_price")
+
+# Second iteration
+train_df_wo_outlier$abs.ei <- abs(g2$residuals)
+g3 <- lm(as.formula(paste("abs.ei ~",  paste(x_best, collapse = "+"))), data = train_df_wo_outlier)
+s <- g3$fitted.values
+wi = 1/(s^2)
+g4 <- lm(as.formula(paste("log_price ~", paste(x_best, collapse = "+"))), weights=wi, data = train_df_wo_outlier)
+model_wls2_performance <- model_performance(g4, "log_price")
+```
+
+### Ridge
+
+We also applied Ridge Regression, which is used when multicollinearity is an issue.
+
+```{r, fig.align='center', fig.height=3, fig.width=5}
+train_df_wo_outlier$`renovated_dummy:log_age` <- train_df_wo_outlier$renovated_dummy * train_df_wo_outlier$log_age
+train_df_clean <- train_df_wo_outlier[c('log_price', x_best)]
+
+x <- model.matrix(log_price ~ ., train_df_clean)[,-1]
+y <- train_df_wo_outlier$log_price
+
+test_df$`renovated_dummy:log_age` <- test_df$renovated_dummy * test_df$log_age
+
+test_df_clean <- test_df[c('log_price', x_best)]
+test_df_clean.model.matrix <- model.matrix(log_price ~ ., test_df_clean)[,-1]
+
+RidgeMod <- glmnet(x, y, alpha=0, nlambda=100, lambda.min.ratio=0.0001)
+CvRidgeMod <- cv.glmnet(x, y, alpha=0, nlambda=100, lambda.min.ratio=0.0001)
+
+best.lambda.ridge <- CvRidgeMod$lambda.min
+y_hat.ridge <- predict(RidgeMod, s = best.lambda.ridge, newx = test_df_clean.model.matrix)
+ridge_test_mse <- mean((test_df$log_price - y_hat.ridge)^2)
+plot(CvRidgeMod)
+```
+
+### Lasso
+
+We also tried using Lasso, since this type of regression is used when the dataset shows high multicollinearity.
+```{r}
+LassoMod <- glmnet(x, y, alpha=1, nlambda=100,lambda.min.ratio=0.0001)
+CvLassoMod <- cv.glmnet(x, y, alpha=1, nlambda=100,lambda.min.ratio=0.0001)
+best.lambda.lasso <- CvLassoMod$lambda.min
+y_hat.lasso <- predict(LassoMod, s = best.lambda.lasso, newx = test_df_clean.model.matrix)
+lasso_test_mse <- mean((test_df$log_price - y_hat.lasso)^2)  
+```
+### Elastic Net
+Finally, we applied the Elastic Net Method.
+```{r}
+EnetMod <- glmnet(x, y, alpha=0.5, nlambda=100,lambda.min.ratio=0.0001)
+CvElasticnetMod <- cv.glmnet(x, y,alpha=0.5,nlambda=100,lambda.min.ratio=0.0001)
+best.lambda.enet <- CvElasticnetMod$lambda.min
+y_hat.enet <- predict(CvElasticnetMod , s = best.lambda.enet, newx = test_df_clean.model.matrix)
+elasticnet_test_mse <- mean((test_df$log_price - y_hat.enet)^2)
+```
+
+### Robust Regression
+Since our model presented multicollinearity issues and violation of the unequal variance assumption, we wanted to try a Robust Regression to see if the same issues could be avoided.
+
+```{r}
+lm.model_bc_robust <- rlm(as.formula(paste("log_price ~",
+                                 paste(c("bedrooms", "bathrooms", "sqft_living_scaled",
+                                                 "sqft_basement_scaled", "sqft_lot_scaled",
+                                                 "sqft_living15_scaled", "sqft_lot15_scaled",
+                                                 "floors", "waterfront", "renovated_dummy",
+                                                 "scaled_age", "grade_category_high_quality",
+                                                 paste0("condition_", 2:5),
+                                                 paste0("view_", c(1, 3, 4)),
+                                         grep("month_sold_", names(KC_House_Sales), value=T),
+                                                 grep("zipcode", names(KC_House_Sales), value = T)
+                                         ), collapse = "+"))), data = train_df)
+
+Y_pred <- predict(lm.model_bc_robust,test_df)
+test_mse_robust <- mean((test_df$log_price - Y_pred)^2)
+```
+
+```{r, include=F}
+# Unequal variance 
+bptest_result <- bptest(lm.model_bc_robust)
+bptest_result
+
+if (bptest_result$p.value[[1]] > 0.05){
+        print("Equal Variance assumption holds.")
+} else {
+        print("Equal Variance assumption is violated.")
+}
+
+# Multicollinearity
+sort(vif(lm.model_bc_robust), decreasing=T)[1:5]
+
+if (max(vif(lm.model_bc_robust)) > 10) {
+        print("There exists problem of severe multicollinearity.")
+} else {
+        print("No severe multicollinearity detected.")
+}
+```
+
+# Alternative Models
+## Random Forest
+
+```{r, fig.align='center', fig.height=5}
+rf_house_price <- randomForest(as.formula(paste("log_price ~",
+                                                paste(
+                                                  c(
+                                                    "bedrooms",
+                                                    "bathrooms",
+                                                    "sqft_living_scaled",
+                                                    "sqft_basement_scaled",
+                                                    "sqft_lot_scaled",
+                                                    "sqft_living15_scaled",
+                                                    "sqft_lot15_scaled",
+                                                    "floors",
+                                                    "waterfront",
+                                                    "renovated_dummy",
+                                                    "scaled_age",
+                                                    paste0("condition_", 2:5),
+                                                    paste0("view_", c(1, 3, 4)),
+                                                    grep("month_sold_", names(KC_House_Sales), value =
+                                                           T),
+                                                    grep("grade_category", names(KC_House_Sales), value =
+                                                           T),
+                                                    grep("zipcode", names(KC_House_Sales), value = T)
+                                                  ),
+                                                  collapse = "+"
+                                                ))), data = train_df_wo_outlier, ntree = 50)
+
+varImpPlot(rf_house_price)
+rf_pred <- predict(rf_house_price, test_df)
+rf_test_mse <- mean((test_df$log_price - rf_pred) ^ 2)
+```
+
+## Regression Tree
+
+```{r, include=F}
+OG_KC_House_Sales <- read_csv("KC_House_Sales.csv") %>% as.data.frame()
+OG_KC_House_Sales <- OG_KC_House_Sales %>%
+        
+        # Convert price to clean numeric format
+        mutate(price = as.numeric(gsub(pattern="\\$|,", replacement="", x=KC_House_Sales$price))) %>%
+        
+        # Remove id, long, lat
+        dplyr::select(-c(id, long, lat)) %>% 
+        
+        # Change date type, convert zipcode to character variable (or factor variable)
+        mutate(date = as.Date(date), zipcode = as.character(zipcode)) %>% 
+        
+        # Convert `view` and `condition` to factor variables
+        mutate_at(c("view","condition"), factor) %>%
+        
+        # Recategorize grade
+        mutate(grade_category = case_when(
+                grade<=3  ~ "low_quality",
+                grade>=11 ~ "high_quality",
+                TRUE      ~ "average_quality")) %>%
+        
+        mutate(month_sold = month(date), age = ifelse(date - yr_built < 0, 0, date - yr_built)) %>%
+
+        dplyr::select(-c(date, grade, yr_built))
+
+set.seed(1023)
+DataSplit <- createDataPartition(y=OG_KC_House_Sales$price, p=0.7, list=F)
+tree_train <- OG_KC_House_Sales[DataSplit, ]
+tree_test <- OG_KC_House_Sales[-DataSplit, ]
+```
+
+```{r}
+reg_tree_model <- rpart(price ~., data=tree_train, control=rpart.control(minsplit=50, cp=0.01, xval=10))
+
+reg_tree_model$variable.importance
+Y_pred_tree <- predict(reg_tree_model,tree_test)
+test_mse_tree<- mean((tree_test$price - Y_pred_tree)^2)
+```
+
+# Limitations and Assumptions
+
+Our group was tasked with building a model to predict house sale prices for Washington's Kings County, which includes the city of Seattle. Because of this, we can say our model has geographic limitations, meaning that our model should only be used to predict prices in Washington's Kings County. Addtitionally, this model is limited due to our dataset, KC_House_Sales. This dataset only contains information about homes sold in Kings County between May 2014 and May 2015, therefore our model can only be used to predict house prices from sales done in this time frame. We don't believe this can be expanded for years outside of this timeframe or make future predictions, seeing as how only having access to two years of data is not sufficient to predict overall house market trends. In further analyses, if this is the desired outcome, we belive it would be optimal to include at least 10 years worth of house sale data.
+
+Assumptions:
+
+* No multicollinearity
+* Linear relationship between explanatory and response variables
+* Homoscedasticity of error terms
+* Normal distribution of model residuals
+
+# Model Comparison and Choosing the Champion Model 
+
+```{r}
+compare_models_test_mse <- cbind(
+  "Model" = c("Model_Basic", "Model_Scaled", "Model_Boxcox", "Model_No_Interactions",
+    "Model_No_Outliers", "Model_No_Conditions", "WLS", "Ridge", "Lasso", "Elastic_Net",
+    "Robust", "Tree"),
+  rbind(
+    model_performance(lm.model_basic, "price")$test_mse,
+    model_performance(lm.model_basic_scaled, "price")$test_mse,
+    model_performance(lm.model_bc, "log_price")$test_mse,
+    model_performance(lm.model_bc_wo_interaction, "log_price")$test_mse,
+    model_performance(lm.model_wo_outlier, "log_price")$test_mse,
+    model_performance(lm.model_drop_condition_345, "log_price")$test_mse,
+    model_performance(g4, "log_price")$test_mse,
+    ridge_test_mse, lasso_test_mse, elasticnet_test_mse, test_mse_robust, test_mse_tree
+  ) %>% round(5),  
+  rbind(
+    model_performance(lm.model_basic, "price")$r2.adj,
+    model_performance(lm.model_basic_scaled, "price")$r2.adj,
+    model_performance(lm.model_bc, "log_price")$r2.adj,
+    model_performance(lm.model_bc_wo_interaction, "log_price")$r2.adj,
+    model_performance(lm.model_wo_outlier, "log_price")$r2.adj,
+    model_performance(lm.model_drop_condition_345, "log_price")$r2.adj,
+    model_performance(g4, "log_price")$r2.adj,
+    NA, NA, NA, NA, NA
+  ) %>% round(3)) %>% as.data.frame()
+
+colnames(compare_models_test_mse) <- c("Model", "Test MSE","Adj_R2")
+rownames(compare_models_test_mse) <- c()
+
+kable(compare_models_test_mse) %>% row_spec(0,bold=TRUE)
+```
+
+From the table above, we can see that `Model_No_Outliers` outperforms other models with regards to Adjusted $R^2$, and `Model_Boxcox` and `Model_No_Interactions` has the lowest test MSE. 
+
+# Ongoing Model Monitoring Plan
+After deployment, our model will most likely be working with new data that it has never seen before. Additionally, we can expect natural changes to occur (e.g., data source changes, changes in the environment the model operates in) throughout the life cycle of our model. Due to this, we can expect that our model's performance will start to degrade over time. Without proper model monitoring, performance degradation might go unnoticed, which can result in wasted resources or making incorrect recommendations to clients. To avoid these consequences, timely, ongoing model monitoring should take place to intervene and prevent performance degradation. The objective of our model monitoring plan is to ensure that our model performs as expected throughout its life cycle. 
+
+## Performance Metrics & Thresholds
+We recommend using Adjusted R-Squared as the metric to guide model performance evaluation. Additionally, to timely intervene and prevent performance degradation, we must have thresholds in place that will signal users to a decrease in model performance.
+
+* Warning threshold (Adj. R-squared 0.2-0.4)
+* Critical threshold (Adj. R-squared < 0.2 or > 0.99)
+
+If a warning threshold is triggered, this does not mean that the model cannot be used, but it should signal to the user that a thorough investigation must take place to verify that the model is still performing as intended. Alternatively, if a critical threshold is triggered, this should signal to the user that something is critically wrong with the model and immediate action should take place, this might mean taking the model out of production in order to re-calibrate or replace it.
+
+## Monitoring Frequency & Recalibration Plan
+To ensure that our model is performing as expected, we propose that model performance be monitored on at least an annual basis. Research shows that average home values increase by 3.5 to 3.8 percent each year, but recent volatile market trends show this can vary largely by year. Since our model predicts house prices in Washington's King County area, we can imagine that local housing market trends will likely affect our model's performance. Therefore, we believe that model performance should be monitored annually, and that the model should be tested with new, unseen data every year.
+
+In the case that the model is shown to be constantly underperforming, we leave it up to individual users to decide if the model should be re-trained, or if a brand new model should be created instead.
+
+\newpage
+
+# Appendix
+
+## 1
+```{r}
+# ## 1
+# Analysis of Variance Table
+# Model 1: log_price ~ bedrooms + bathrooms + sqft_living_scaled + sqft_basement_scaled + 
+#     sqft_lot_scaled + sqft_living15_scaled + sqft_lot15_scaled + 
+#     floors + waterfront + renovated_dummy + renovated_dummy:scaled_age + 
+#     scaled_age + month_sold + condition_2 + condition_3 + condition_4 + 
+#     condition_5 + view_1 + view_2 + view_3 + view_4 + grade_category_high_quality + 
+#     grade_category_low_quality + zipcode_98002 + zipcode_98003 + 
+#     zipcode_98004 + zipcode_98005 + zipcode_98006 + zipcode_98007 + 
+#     zipcode_98008 + zipcode_98010 + zipcode_98011 + zipcode_98014 + 
+#     zipcode_98019 + zipcode_98022 + zipcode_98023 + zipcode_98024 + 
+#     zipcode_98027 + zipcode_98028 + zipcode_98029 + zipcode_98030 + 
+#     zipcode_98031 + zipcode_98032 + zipcode_98033 + zipcode_98034 + 
+#     zipcode_98038 + zipcode_98039 + zipcode_98040 + zipcode_98042 + 
+#     zipcode_98045 + zipcode_98052 + zipcode_98053 + zipcode_98055 + 
+#     zipcode_98056 + zipcode_98058 + zipcode_98059 + zipcode_98065 + 
+#     zipcode_98070 + zipcode_98072 + zipcode_98074 + zipcode_98075 + 
+#     zipcode_98077 + zipcode_98092 + zipcode_98102 + zipcode_98103 + 
+#     zipcode_98105 + zipcode_98106 + zipcode_98107 + zipcode_98108 + 
+#     zipcode_98109 + zipcode_98112 + zipcode_98115 + zipcode_98116 + 
+#     zipcode_98117 + zipcode_98118 + zipcode_98119 + zipcode_98122 + 
+#     zipcode_98125 + zipcode_98126 + zipcode_98133 + zipcode_98136 + 
+#     zipcode_98144 + zipcode_98146 + zipcode_98148 + zipcode_98155 + 
+#     zipcode_98166 + zipcode_98168 + zipcode_98177 + zipcode_98178 + 
+#     zipcode_98188 + zipcode_98198 + zipcode_98199
+# Model 2: log_price ~ bedrooms + bathrooms + sqft_living_scaled + sqft_basement_scaled + 
+#     sqft_lot_scaled + sqft_living15_scaled + sqft_lot15_scaled + 
+#     floors + waterfront + renovated_dummy + scaled_age + month_sold + 
+#     condition_2 + condition_3 + condition_4 + condition_5 + view_1 + 
+#     view_2 + view_3 + view_4 + grade_category_high_quality + 
+#     grade_category_low_quality + zipcode_98002 + zipcode_98003 + 
+#     zipcode_98004 + zipcode_98005 + zipcode_98006 + zipcode_98007 + 
+#     zipcode_98008 + zipcode_98010 + zipcode_98011 + zipcode_98014 + 
+#     zipcode_98019 + zipcode_98022 + zipcode_98023 + zipcode_98024 + 
+#     zipcode_98027 + zipcode_98028 + zipcode_98029 + zipcode_98030 + 
+#     zipcode_98031 + zipcode_98032 + zipcode_98033 + zipcode_98034 + 
+#     zipcode_98038 + zipcode_98039 + zipcode_98040 + zipcode_98042 + 
+#     zipcode_98045 + zipcode_98052 + zipcode_98053 + zipcode_98055 + 
+#     zipcode_98056 + zipcode_98058 + zipcode_98059 + zipcode_98065 + 
+#     zipcode_98070 + zipcode_98072 + zipcode_98074 + zipcode_98075 + 
+#     zipcode_98077 + zipcode_98092 + zipcode_98102 + zipcode_98103 + 
+#     zipcode_98105 + zipcode_98106 + zipcode_98107 + zipcode_98108 + 
+#     zipcode_98109 + zipcode_98112 + zipcode_98115 + zipcode_98116 + 
+#     zipcode_98117 + zipcode_98118 + zipcode_98119 + zipcode_98122 + 
+#     zipcode_98125 + zipcode_98126 + zipcode_98133 + zipcode_98136 + 
+#     zipcode_98144 + zipcode_98146 + zipcode_98148 + zipcode_98155 + 
+#     zipcode_98166 + zipcode_98168 + zipcode_98177 + zipcode_98178 + 
+#     zipcode_98188 + zipcode_98198 + zipcode_98199
+#   Res.Df    RSS Df Sum of Sq      F Pr(>F)
+# 1  15038 551.85                           
+# 2  15039 551.92 -1 -0.065516 1.7853 0.1815
+```
+
+## 2
+```{r}
+#                                          Stepwise Selection Summary                                           
+# -------------------------------------------------------------------------------------------------------------
+#                                         Added/                   Adj.                                            
+# Step             Variable              Removed     R-Square    R-Square       C(p)          AIC         RMSE     
+# -------------------------------------------------------------------------------------------------------------
+#    1             bedrooms              addition       0.522       0.522    39854.6980    12469.4952    0.3652    
+#    2             bathrooms             addition       0.574       0.574    33915.5070    10740.8087    0.3449    
+#    3        sqft_living_scaled         addition       0.594       0.594    31565.8430     9999.0637    0.3366    
+#    4       sqft_basement_scaled        addition       0.610       0.610    29789.6980     9413.3849    0.3301    
+#    5       sqft_living15_scaled        addition       0.621       0.621    28492.5950     8971.1247    0.3253    
+#    6              floors               addition       0.630       0.630    27443.9670     8604.0450    0.3214    
+#    7    grade_category_high_quality    addition       0.639       0.638    26465.0920     8253.1487    0.3177    
+#    8            scaled_age             addition       0.647       0.647    25460.8670     7884.3719    0.3138    
+#    9           zipcode_98004           addition       0.657       0.656    24409.7520     7488.3332    0.3097    
+#   10           zipcode_98023           addition       0.665       0.664    23485.9680     7131.5576    0.3061    
+#   11           zipcode_98042           addition       0.672       0.672    22623.5460     6790.7040    0.3026    
+#   12           zipcode_98168           addition       0.680       0.680    21736.6070     6431.8319    0.2991    
+#   13           zipcode_98003           addition       0.688       0.687    20835.8190     6058.3109    0.2954    
+#   14           zipcode_98092           addition       0.696       0.695    19904.8930     5662.2066    0.2915    
+#   15           zipcode_98038           addition       0.703       0.703    19032.6300     5281.3821    0.2879    
+#   16           zipcode_98002           addition       0.711       0.710    18203.6390     4910.3013    0.2844    
+#   17           zipcode_98198           addition       0.718       0.718    17336.0170     4511.7691    0.2806    
+#   18           zipcode_98031           addition       0.725       0.724    16591.8490     4161.4381    0.2774    
+#   19           zipcode_98058           addition       0.731       0.731    15872.8850     3815.0329    0.2742    
+#   20           zipcode_98030           addition       0.737       0.736    15206.6890     3486.8041    0.2713    
+#   21           zipcode_98055           addition       0.741       0.741    14674.5940     3219.5664    0.2689    
+#   22            waterfront             addition       0.746       0.746    14152.2450     2952.4981    0.2665    
+#   23           zipcode_98178           removal        0.746       0.745    14156.3410     2953.6541    0.2665    
+#   24           zipcode_98022           addition       0.750       0.750    13644.6500     2687.3884    0.2642    
+#   25           zipcode_98112           addition       0.755       0.754    13125.8010     2412.4399    0.2618    
+#   26           zipcode_98032           addition       0.760       0.759    12566.4390     2110.1622    0.2592    
+#   27           zipcode_98188           addition       0.765       0.765    11965.3950     1778.3268    0.2563    
+#   28           zipcode_98040           addition       0.770       0.770    11345.9520     1428.4220    0.2534    
+#   29       sqft_basement_scaled        addition       0.775       0.775    10768.2810     1094.6261    0.2506    
+#   30           zipcode_98033           addition       0.781       0.780    10189.4610      752.5202    0.2478    
+#   31           zipcode_98115           addition       0.785       0.784     9681.0640      445.5386    0.2453    
+#   32           zipcode_98199           addition       0.789       0.789     9183.0230      138.5808    0.2428    
+#   33           zipcode_98117           addition       0.794       0.793     8647.0680     -199.0011    0.2401    
+#   34           zipcode_98103           addition       0.799       0.798     8126.3660     -534.4199    0.2374    
+#   35           zipcode_98105           addition       0.803       0.802     7646.3410     -850.3936    0.2349    
+#   36           zipcode_98119           removal        0.803       0.802     7646.6110     -850.8802    0.2349    
+#   37           zipcode_98107           addition       0.807       0.806     7203.3320    -1148.6417    0.2326    
+#   38           zipcode_98122           removal        0.807       0.806     7206.5150    -1147.1186    0.2327    
+#   39           zipcode_98116           addition       0.809       0.809     6912.0620    -1347.9874    0.2311    
+#   40           zipcode_98109           addition       0.812       0.811     6605.5290    -1560.0523    0.2295    
+#   41           zipcode_98039           addition       0.814       0.814     6322.6200    -1758.4522    0.2280    
+#   42    grade_category_high_quality    addition       0.817       0.816     6038.5490    -1960.3757    0.2265    
+#   43           zipcode_98102           addition       0.819       0.819     5743.4260    -2173.1284    0.2249    
+#   44              floors               addition       0.822       0.821     5445.2710    -2391.2124    0.2232    
+#   45           zipcode_98052           addition       0.824       0.824     5194.5160    -2577.0565    0.2219    
+#   46           zipcode_98006           addition       0.826       0.826     4978.0810    -2739.2944    0.2207    
+#   47           zipcode_98136           addition       0.828       0.827     4774.1550    -2893.7763    0.2195    
+#   48           zipcode_98005           addition       0.830       0.829     4583.2010    -3039.8851    0.2185    
+#   49           zipcode_98144           addition       0.831       0.831     4367.4690    -3206.7719    0.2173    
+#   50           zipcode_98008           addition       0.833       0.833     4168.1380    -3362.6330    0.2161    
+#   51          sqft_lot_scaled          addition       0.835       0.835     3948.6970    -3536.1851    0.2149    
+#   52           zipcode_98029           addition       0.837       0.837     3712.7870    -3725.0910    0.2136    
+#   53           zipcode_98177           addition       0.839       0.838     3509.8530    -3889.4895    0.2124    
+#   54           zipcode_98074           addition       0.841       0.840     3293.3830    -4066.9168    0.2111    
+#   55           zipcode_98053           addition       0.842       0.842     3115.4810    -4214.2831    0.2101    
+#   56           zipcode_98034           addition       0.844       0.843     2945.5460    -4356.4263    0.2091    
+#   57           zipcode_98125           addition       0.845       0.845     2793.6510    -4484.6202    0.2082    
+#   58           zipcode_98126           addition       0.846       0.846     2661.6050    -4596.9429    0.2075    
+#   59           zipcode_98007           addition       0.848       0.847     2513.5850    -4723.9209    0.2066    
+#   60           zipcode_98075           addition       0.849       0.848     2377.3490    -4841.7497    0.2058    
+#   61           zipcode_98027           addition       0.850       0.849     2242.8660    -4958.9963    0.2050    
+#   62            condition_5            addition       0.851       0.850     2141.1580    -5048.2405    0.2044    
+#   63              view_4               addition       0.852       0.851     2040.3820    -5137.2101    0.2037    
+#   64              view_3               addition       0.853       0.852     1946.0910    -5220.9392    0.2032    
+#   65              view_2               removal        0.853       0.852     1945.7740    -5221.4367    0.2032    
+#   66           zipcode_98072           addition       0.854       0.853     1841.1100    -5314.9617    0.2025    
+#   67           zipcode_98133           addition       0.855       0.854     1728.7990    -5416.0089    0.2019    
+#   68            condition_2            addition       0.855       0.855     1646.2250    -5490.7040    0.2014    
+#   69            month_sold             addition       0.856       0.855     1574.4490    -5555.9255    0.2009    
+#   70           zipcode_98118           addition       0.857       0.856     1496.1030    -5627.4744    0.2004    
+#   71            scaled_age             addition       0.857       0.857     1424.6590    -5693.0199    0.2000    
+#   72           zipcode_98155           addition       0.858       0.857     1365.6020    -5747.4035    0.1996    
+#   73           zipcode_98077           addition       0.859       0.858     1258.9560    -5846.2568    0.1990    
+#   74          renovated_dummy          addition       0.859       0.858     1228.3940    -5874.6140    0.1988    
+#   75           zipcode_98028           addition       0.859       0.859     1190.6550    -5909.7457    0.1985    
+#   76           zipcode_98011           addition       0.860       0.859     1158.1650    -5940.0471    0.1983    
+#   77              view_1               addition       0.860       0.859     1124.5480    -5971.4763    0.1981    
+#   78            condition_4            addition       0.860       0.860     1090.5210    -6003.3655    0.1979    
+#   79            condition_3            addition       0.861       0.860     1058.4840    -6033.4519    0.1977    
+#   80           zipcode_98065           addition       0.861       0.860     1014.6700    -6074.7497    0.1974    
+#   81           zipcode_98059           addition       0.862       0.861      957.3780    -6128.9682    0.1971    
+#   82           zipcode_98108           removal        0.862       0.861      959.1280    -6127.4071    0.1971    
+#   83           zipcode_98045           addition       0.862       0.861      916.5160    -6167.8353    0.1968    
+#   84           zipcode_98024           removal        0.862       0.861      917.0000    -6167.4691    0.1968    
+#   85           zipcode_98056           addition       0.862       0.862      864.9620    -6217.0140    0.1965    
+#   86           zipcode_98166           removal        0.862       0.862      864.0430    -6217.9811    0.1965    
+#   87           zipcode_98106           addition       0.863       0.862      807.1890    -6272.3158    0.1961    
+#   88           zipcode_98058           removal        0.863       0.862      807.2010    -6272.3867    0.1961    
+#   89           zipcode_98019           addition       0.863       0.863      740.1530    -6336.7392    0.1957    
+#   90           zipcode_98038           removal        0.863       0.863      740.7110    -6336.2764    0.1957    
+#   91           zipcode_98146           addition       0.864       0.863      723.6780    -6352.6141    0.1956    
+# -------------------------------------------------------------------------------------------------------------
+```
+
+
+
+
+
+
+
+
+
+
+
+
